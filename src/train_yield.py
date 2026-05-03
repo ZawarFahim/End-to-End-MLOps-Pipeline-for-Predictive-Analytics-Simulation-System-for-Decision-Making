@@ -20,6 +20,8 @@ from typing import Any, Iterable
 
 import joblib
 import pandas as pd
+import numpy as np
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -110,12 +112,16 @@ def train_compare_and_save(
             "RandomForestRegressor",
             Pipeline([
                 ("preprocessor", preprocessor),
-                ("regressor", RandomForestRegressor(
-                    n_estimators=10,
-                    max_depth=None,
-                    min_samples_leaf=2,
-                    random_state=random_state,
-                    n_jobs=1,
+                ("regressor", TransformedTargetRegressor(
+                    regressor=RandomForestRegressor(
+                        n_estimators=10,
+                        max_depth=None,
+                        min_samples_leaf=2,
+                        random_state=random_state,
+                        n_jobs=1,
+                    ),
+                    func=np.log1p,
+                    inverse_func=np.expm1
                 ))
             ]),
         ),
@@ -123,7 +129,11 @@ def train_compare_and_save(
             "LinearRegression",
             Pipeline([
                 ("preprocessor", preprocessor),
-                ("regressor", LinearRegression())
+                ("regressor", TransformedTargetRegressor(
+                    regressor=LinearRegression(),
+                    func=np.log1p,
+                    inverse_func=np.expm1
+                ))
             ]),
         ),
     ]

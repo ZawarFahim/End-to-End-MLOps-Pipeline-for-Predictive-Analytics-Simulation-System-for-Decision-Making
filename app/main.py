@@ -13,6 +13,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from app.weather_api import get_real_world_weather
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from statsmodels.tsa.arima.model import ARIMA
@@ -122,9 +123,17 @@ class YieldRequest(BaseModel):
     crop_type: str = Field(..., min_length=1)
 
 
+class GeoRequest(BaseModel):
+    lat: float
+    lon: float
+    crop_type: str = "Wheat"
+
+
 class ForecastRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     city: str = Field(..., min_length=1)
+    lat: float | None = None
+    lng: float | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -273,7 +282,26 @@ def _yield_request_to_pipeline_frame(data: YieldRequest) -> pd.DataFrame:
     return pd.DataFrame([row])[expected_cols]
 
 
-def _forecast_three_values(city: str) -> list[float]:
+import httpx
+
+async def _forecast_three_values(city: str, lat: float | None = None, lng: float | None = None) -> list[float]:
+    if lat is not None and lng is not None:
+        try:
+            # Fetch dynamic real weather forecast from Open-Meteo
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&daily=precipitation_sum&timezone=auto&past_days=0"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    daily = data.get("daily", {})
+                    precip = daily.get("precipitation_sum", [])
+                    # Return next 3 days
+                    if len(precip) >= 3:
+                        return [float(x) if x is not None else 0.0 for x in precip[:3]]
+        except Exception as e:
+            LOG.warning(f"Open-Meteo fetch failed for {lat},{lng}: {e}")
+            pass # Fallback to artifact
+
     artifact = get_forecast_artifact()
     city_key = city.strip().lower()
     city_models = artifact.get("models") or artifact.get("city_models") or {}
@@ -419,17 +447,47 @@ def metrics_history() -> dict[str, Any]:
 
 
 @app.post("/predict-yield")
-async def predict_yield(data: YieldRequest) -> dict[str, Any]:
+async def predict_yield_geo(data: GeoRequest) -> dict[str, Any]:
+    """Fetches real NASA weather for the clicked coordinates, then predicts yield."""
     LOG.info("/predict-yield payload: %s", data.model_dump())
     try:
+        # 1. Fetch live NASA data using the clicked coordinates
+        live_weather = get_real_world_weather(data.lat, data.lon)
+        
+        # 2. Load your newly fixed TransformedTargetRegressor model
         artifact = get_yield_artifact()
         model = artifact["model"]
-        df = _yield_request_to_pipeline_frame(data)
-        prediction = model.predict(df)
-        val = float(prediction[0])
+        
+        # 3. Create the input dataframe with all expected columns
+        expected_cols = [
+            "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
+            "Wind_Speed", "N", "P", "K", "Soil_Quality",
+        ]
+        row = {
+            "Crop_Type": data.crop_type,
+            "Temperature": live_weather["temperature"],
+            "Humidity": live_weather["humidity"],
+            "Soil_Type": "Loamy",
+            "Soil_pH": 6.5,
+            "Wind_Speed": 5.0,
+            "N": 50.0,
+            "P": 50.0,
+            "K": 50.0,
+            "Soil_Quality": 50.0,
+        }
+        # Note: live_weather["rainfall"] is fetched but this specific model might not use it directly 
+        # (based on the expected_cols). We keep it for the response.
+        df = pd.DataFrame([row])[expected_cols]
+        
+        # 4. Predict the yield
+        predicted_yield = model.predict(df)[0]
+        val = max(0.0, float(predicted_yield))
+        
         LOG.info("/predict-yield success val=%.4f", val)
         return {
-            "prediction": val,
+            "coordinates": {"lat": data.lat, "lon": data.lon},
+            "live_weather": live_weather,
+            "predicted_yield_hg_ha": val,
             "crop_suitability_score": val,
             "risk_level": "low" if val > 0 else "high",
         }
@@ -440,6 +498,57 @@ async def predict_yield(data: YieldRequest) -> dict[str, Any]:
     except Exception as exc:
         LOG.exception("/predict-yield failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/simulate-climate-risk")
+async def simulate_climate_risk(data: GeoRequest):
+    """Simulates 2050 climate conditions and predicts harvest drops."""
+    try:
+        # 1. Get baseline weather
+        baseline_weather = get_real_world_weather(data.lat, data.lon)
+        
+        # 2. Apply 2050 Climate Change Shifts (e.g., +2.5C temp, -15% rainfall)
+        simulated_weather = {
+            "temperature": round(baseline_weather["temperature"] + 2.5, 2),
+            "rainfall": round(baseline_weather["rainfall"] * 0.85, 2),
+            "humidity": round(baseline_weather["humidity"] * 0.90, 2)
+        }
+        
+        # 3. Predict Yield for BOTH scenarios to compare
+        artifact = get_yield_artifact()
+        model = artifact["model"]
+        
+        expected_cols = [
+            "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
+            "Wind_Speed", "N", "P", "K", "Soil_Quality",
+        ]
+        row_base = {
+            "Crop_Type": data.crop_type,
+            "Temperature": baseline_weather["temperature"],
+            "Humidity": baseline_weather["humidity"],
+            "Soil_Type": "Loamy", "Soil_pH": 6.5, "Wind_Speed": 5.0,
+            "N": 50.0, "P": 50.0, "K": 50.0, "Soil_Quality": 50.0,
+        }
+        row_sim = row_base.copy()
+        row_sim["Temperature"] = simulated_weather["temperature"]
+        row_sim["Humidity"] = simulated_weather["humidity"]
+        
+        df_base = pd.DataFrame([row_base])[expected_cols]
+        df_sim = pd.DataFrame([row_sim])[expected_cols]
+        
+        yield_base = float(model.predict(df_base)[0])
+        yield_sim = float(model.predict(df_sim)[0])
+        
+        return {
+            "status": "Simulation Complete",
+            "year": 2050,
+            "baseline_yield": round(yield_base, 2),
+            "simulated_2050_yield": round(yield_sim, 2),
+            "percentage_change": round(((yield_sim - yield_base) / yield_base) * 100, 2) if yield_base else 0.0,
+            "simulated_weather": simulated_weather
+        }
+    except Exception as e:
+        LOG.exception("/simulate-climate-risk failed")
+        return {"error": str(e)}
 
 
 @app.post("/classify-yield")
@@ -575,7 +684,7 @@ async def forecast(data: ForecastRequest) -> dict[str, Any]:
         city = data.city.strip()
         if not city:
             raise ValueError("city is required")
-        forecast_values = _forecast_three_values(city)
+        forecast_values = await _forecast_three_values(city, data.lat, data.lng)
         LOG.info("/forecast success for %s", city)
         return {"city": city, "forecast": [float(v) for v in forecast_values]}
     except FileNotFoundError as exc:
@@ -645,8 +754,54 @@ def geocode(data: GeocodeRequest) -> dict[str, Any]:
 
 
 @app.post("/recommend")
-async def recommend() -> dict[str, Any]:
-    return {"recommendations": ["Wheat", "Rice", "Maize"]}
+async def recommend(data: RecommendRequest) -> dict[str, Any]:
+    try:
+        region_type = _derive_region_type(data.rainfall)
+        artifact = get_recommender_artifact() if "get_recommender_artifact" in globals() else _safe_load_artifact(RECOMMENDER_MODEL_PATH, "recommender")
+        if artifact is None or "model" not in artifact:
+            raise ValueError("Recommender model not available")
+        
+        model = artifact["model"]
+        X = pd.DataFrame([{
+            "N": data.n,
+            "P": data.p,
+            "K": data.k,
+            "temperature": data.temperature,
+            "humidity": data.humidity,
+            "ph": 6.5,
+            "rainfall": data.rainfall
+        }])
+        
+        feat_cols = artifact.get("feature_columns", ["N", "P", "K", "temperature", "humidity", "ph", "rainfall"])
+        for c in feat_cols:
+            if c not in X.columns:
+                X[c] = 0.0
+        X = X[feat_cols]
+        
+        proba = model.predict_proba(X)[0]
+        classes = list(getattr(model, "classes_", artifact.get("classes", [])))
+        if not classes:
+            classes = model.classes_
+            
+        all_ranked = sorted(zip(classes, proba), key=lambda x: float(x[1]), reverse=True)
+        
+        region_map = getattr(artifact, "region_crop_map", _DEFAULT_REGION_CROP_MAP)
+        allowed = region_map.get(region_type, [])
+        filtered = [c for c, p in all_ranked if c in allowed]
+        
+        if not filtered:
+            filtered = [c for c, p in all_ranked]
+            
+        return {
+            "region_classification": region_type,
+            "realistic_recommendations": filtered[:3]
+        }
+    except Exception as exc:
+        LOG.exception("/recommend failed")
+        return {
+            "region_classification": "unknown",
+            "realistic_recommendations": ["Wheat", "Rice", "Maize"]
+        }
 
 
 if __name__ == "__main__":

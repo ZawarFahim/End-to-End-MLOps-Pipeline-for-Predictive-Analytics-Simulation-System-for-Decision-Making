@@ -186,6 +186,11 @@ export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highligh
         pauseRotationRef.current = true;
         rotatingRef.current = false;
       });
+        rotateTimeoutRef.current = setTimeout(() => { rotatingRef.current = true; }, 1500);
+      };
+      map.on("mousedown", () => { rotatingRef.current = false; });
+      map.on("mouseup", resumeRotation);
+      map.on("dragstart", () => { rotatingRef.current = false; });
       map.on("dragend", resumeRotation);
 
       const spin = () => {
@@ -221,6 +226,14 @@ export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highligh
         animationRef.current = requestAnimationFrame(spin);
       };
       animationRef.current = requestAnimationFrame(spin);
+        if (rotatingRef.current) {
+          const c = mapRef.current.getCenter();
+          c.lng -= 0.05;
+          mapRef.current.easeTo({ center: c, duration: 50, easing: (n) => n, essential: true });
+        }
+        requestAnimationFrame(spin);
+      };
+      requestAnimationFrame(spin);
     });
 
     // Cleanup

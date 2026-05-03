@@ -35,7 +35,7 @@ jobs:
         run: python tests/ml_data_validation.py
 
       - name: Run tests
-        run: pytest tests/
+        run: python -m pytest tests/
 
       - name: Validate data
         run: python src/validate.py

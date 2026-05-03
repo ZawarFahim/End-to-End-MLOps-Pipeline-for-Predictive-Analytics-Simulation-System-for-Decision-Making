@@ -702,6 +702,24 @@ def cluster(request: ClusterRequest) -> dict[str, Any]:
 @app.post("/geocode")
 def geocode(data: GeocodeRequest) -> dict[str, Any]:
     q = data.query.strip().lower()
+    if not q:
+        raise HTTPException(status_code=422, detail="query is required")
+    if _LOCATIONS_DF is None:
+        raise HTTPException(status_code=404, detail="No location dataset available")
+    city = _LOCATIONS_DF["location_name"].astype(str).str.lower()
+    country = _LOCATIONS_DF["country"].astype(str).str.lower()
+
+    exact = _LOCATIONS_DF[(city == q) | (country == q)]
+    startswith = _LOCATIONS_DF[city.str.startswith(q) | country.str.startswith(q)]
+    contains = _LOCATIONS_DF[city.str.contains(q) | country.str.contains(q)]
+
+    if not exact.empty:
+        m = exact
+    elif not startswith.empty:
+        m = startswith
+    elif not contains.empty:
+        m = contains
+    else:
     if _LOCATIONS_DF is None:
         raise HTTPException(status_code=404, detail="No location dataset available")
     m = _LOCATIONS_DF[

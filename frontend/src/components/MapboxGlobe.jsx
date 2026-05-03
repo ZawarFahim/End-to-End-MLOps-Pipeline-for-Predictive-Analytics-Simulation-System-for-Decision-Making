@@ -51,6 +51,9 @@ export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highligh
   const mapRef = useRef(null);
   const rotatingRef = useRef(true);
   const rotateTimeoutRef = useRef(null);
+  const animationRef = useRef(null);
+  const pauseRotationRef = useRef(false);
+  const pulseRef = useRef({ t: 0, dir: 1 });
   // Keep onCitySelect stable — never a stale closure
   const onSelectRef  = useRef(onCitySelect);
   useEffect(() => { onSelectRef.current = onCitySelect; }, [onCitySelect]);
@@ -169,29 +172,62 @@ export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highligh
 
       const resumeRotation = () => {
         if (rotateTimeoutRef.current) clearTimeout(rotateTimeoutRef.current);
-        rotateTimeoutRef.current = setTimeout(() => { rotatingRef.current = true; }, 1500);
+        rotateTimeoutRef.current = setTimeout(() => {
+          rotatingRef.current = true;
+          pauseRotationRef.current = false;
+        }, 1500);
       };
-      map.on("mousedown", () => { rotatingRef.current = false; });
+      map.on("mousedown", () => {
+        pauseRotationRef.current = true;
+        rotatingRef.current = false;
+      });
       map.on("mouseup", resumeRotation);
-      map.on("dragstart", () => { rotatingRef.current = false; });
+      map.on("dragstart", () => {
+        pauseRotationRef.current = true;
+        rotatingRef.current = false;
+      });
       map.on("dragend", resumeRotation);
 
       const spin = () => {
         if (!mapRef.current) return;
-        if (rotatingRef.current) {
-          const c = mapRef.current.getCenter();
-          c.lng -= 0.05;
-          mapRef.current.easeTo({ center: c, duration: 50, easing: (n) => n, essential: true });
+        if (rotatingRef.current && !pauseRotationRef.current) {
+          mapRef.current.rotateTo(
+            mapRef.current.getBearing() + 0.05,
+            { duration: 0 }
+          );
         }
-        requestAnimationFrame(spin);
+
+        // Pulse highlighted marker by animating circle-radius
+        if (mapRef.current.getLayer("city-dots")) {
+          let { t, dir } = pulseRef.current;
+          t += dir * 0.04;
+          if (t >= 1) { t = 1; dir = -1; }
+          if (t <= 0) { t = 0; dir = 1; }
+          pulseRef.current = { t, dir };
+          const pulseRadius = 10 + (6 * t);
+          mapRef.current.setPaintProperty("city-dots", "circle-radius", [
+            "case",
+            ["==", ["downcase", ["to-string", ["get", "name"]]], String(highlightedCity || "").toLowerCase()],
+            pulseRadius,
+            10,
+          ]);
+          mapRef.current.setPaintProperty("city-dots", "circle-color", [
+            "case",
+            ["==", ["downcase", ["to-string", ["get", "name"]]], String(highlightedCity || "").toLowerCase()],
+            "#ff0000",
+            "#e52222",
+          ]);
+        }
+        animationRef.current = requestAnimationFrame(spin);
       };
-      requestAnimationFrame(spin);
+      animationRef.current = requestAnimationFrame(spin);
     });
 
     // Cleanup
     return () => {
       popup.remove();
       if (rotateTimeoutRef.current) clearTimeout(rotateTimeoutRef.current);
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
       map.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -201,6 +237,16 @@ export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highligh
     if (!mapRef.current || !flyToCoord) return;
     mapRef.current.flyTo({ center: [flyToCoord.lng, flyToCoord.lat], zoom: 4, duration: 1200 });
   }, [flyToCoord]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapRef.current.getLayer("city-dots")) return;
+    mapRef.current.setPaintProperty("city-dots", "circle-color", [
+      "case",
+      ["==", ["downcase", ["to-string", ["get", "name"]]], String(highlightedCity || "").toLowerCase()],
+      "#ff0000",
+      "#e52222",
+    ]);
+  }, [highlightedCity]);
 
   return (
     <div

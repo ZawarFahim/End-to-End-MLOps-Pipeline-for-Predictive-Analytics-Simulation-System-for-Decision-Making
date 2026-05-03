@@ -95,6 +95,31 @@ def _derive_region_type(rainfall: float) -> str:
     return "tropical"
 
 
+def _compute_climate_score(temperature: float, humidity: float, rainfall: float) -> float:
+    """Composite index: higher = wetter/warmer."""
+    return temperature * 0.4 + humidity * 0.3 + rainfall * 0.3
+
+
+# Default region constraint map (overridden by model artifact at runtime)
+_DEFAULT_REGION_CROP_MAP: dict[str, list[str]] = {
+    "arid": [
+        "cotton", "millet", "lentil", "chickpea", "pigeonpeas",
+        "mothbeans", "mungbean", "blackgram", "pomegranate",
+    ],
+    "temperate": [
+        "maize", "rice", "lentil", "chickpea", "pigeonpeas",
+        "kidneybeans", "blackgram", "mungbean", "mothbeans",
+        "cotton", "grapes", "apple", "muskmelon", "watermelon",
+        "orange", "papaya",
+    ],
+    "tropical": [
+        "rice", "jute", "coconut", "banana", "papaya", "mango",
+        "coffee", "orange", "watermelon", "muskmelon",
+        "grapes", "kidneybeans", "maize",
+    ],
+}
+
+
 # ---------------------------------------------------------------------------
 # Model loading helpers
 # ---------------------------------------------------------------------------
@@ -347,49 +372,101 @@ async def predict_yield(data: YieldRequest) -> dict[str, Any]:
 @app.post("/classify-yield")
 async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
     """
-    Classify crop type from climate inputs.
-    Returns top-3 crop recommendations with confidence and risk level.
-    Input: temperature, rainfall, humidity (no crop_type needed).
-    """
-    LOG.info("/classify-yield payload: temp=%.1f rain=%.1f hum=%.1f",
-             data.temperature, data.rainfall, data.humidity)
-    try:
-        # Derive region type
-        region_type = _derive_region_type(data.rainfall)
+    Region-aware crop classification.
 
-        # Build input dataframe
+    Steps:
+      1. Derive region_type + climate_score from inputs
+      2. Build full feature row (N/P/K defaulted if absent)
+      3. Run RandomForest → get top-N probabilities
+      4. Apply REGION_CROP_MAP constraint filter
+      5. Fallback to unfiltered if constraint removes everything
+      6. Return top-3 with confidence, risk, region, climate_score
+    """
+    LOG.info(
+        "/classify-yield  temp=%.1f  rain=%.1f  hum=%.1f",
+        data.temperature, data.rainfall, data.humidity,
+    )
+    try:
+        # ── Derived features ──────────────────────────────────────────────
+        region_type   = _derive_region_type(data.rainfall)
+        climate_score = _compute_climate_score(
+            data.temperature, data.rainfall, data.humidity
+        )
+        LOG.info("Region: %s  climate_score: %.2f", region_type, climate_score)
+
+        # ── Build feature DataFrame ───────────────────────────────────────
+        # N/P/K are auto-filled with dataset-average defaults when not supplied
         X = pd.DataFrame([{
-            "temperature": float(data.temperature),
-            "rainfall": float(data.rainfall),
-            "humidity": float(data.humidity),
-            "region_type": region_type,
+            "n":             70.0,
+            "p":             40.0,
+            "k":             40.0,
+            "temperature":   float(data.temperature),
+            "humidity":      float(data.humidity),
+            "rainfall":      float(data.rainfall),
+            "climate_score": climate_score,
+            "region_type":   region_type,
         }])
 
         artifact = get_classifier_artifact()
-        model = artifact["model"]
+        model    = artifact["model"]
+
+        # Reorder columns to match training feature order (if stored)
+        feat_cols = artifact.get("feature_columns")
+        if feat_cols:
+            for c in feat_cols:
+                if c not in X.columns:
+                    X[c] = 0.0
+            X = X[feat_cols]
 
         if not hasattr(model, "predict_proba"):
-            raise ValueError("Classifier model does not support probability predictions.")
+            raise ValueError("Classifier model does not support predict_proba.")
 
-        proba = model.predict_proba(X)[0]
+        proba   = model.predict_proba(X)[0]
         classes = list(getattr(model, "classes_", artifact.get("class_labels", [])))
         if not classes:
             raise ValueError("Classifier class labels unavailable.")
 
-        ranked = sorted(zip(classes, proba), key=lambda item: float(item[1]), reverse=True)[:3]
-        top_crops = [str(lbl) for lbl, _ in ranked]
-        confidence_scores = [round(float(prob), 4) for _, prob in ranked]
-        max_prob = float(confidence_scores[0]) if confidence_scores else 0.0
+        # All crops sorted by probability descending
+        all_ranked = sorted(zip(classes, proba), key=lambda x: float(x[1]), reverse=True)
+        LOG.info("Raw top-5: %s", [(c, round(float(p), 3)) for c, p in all_ranked[:5]])
 
-        risk_level = _risk_from_probability(max_prob)
-        LOG.info("/classify-yield → top=%s risk=%s region=%s", top_crops[0], risk_level, region_type)
+        # ── Region constraint filter ──────────────────────────────────────
+        region_map: dict[str, list[str]] = artifact.get(
+            "region_crop_map", _DEFAULT_REGION_CROP_MAP
+        )
+        allowed: list[str] = region_map.get(region_type, [])
+
+        filtered = [(c, p) for c, p in all_ranked if c in allowed]
+        LOG.info("Filtered (%s): %s", region_type,
+                 [(c, round(float(p), 3)) for c, p in filtered[:5]])
+
+        # Fallback: if constraint removes everything use raw predictions
+        if not filtered:
+            LOG.warning("Region filter removed all crops — using raw predictions (fallback)")
+            filtered = all_ranked
+
+        top3 = filtered[:3]
+
+        # Re-normalise probabilities so they sum to 1
+        total = sum(float(p) for _, p in top3) or 1.0
+        top_crops        = [str(c) for c, _ in top3]
+        confidence_scores = [round(float(p) / total, 4) for _, p in top3]
+        max_prob         = confidence_scores[0] if confidence_scores else 0.0
+        risk_level       = _risk_from_probability(max_prob)
+
+        LOG.info(
+            "/classify-yield -> top=%s  risk=%s  region=%s",
+            top_crops[0], risk_level, region_type,
+        )
 
         return {
-            "top_crops": top_crops,
+            "top_crops":        top_crops,
             "confidence_scores": confidence_scores,
-            "risk_level": risk_level,
-            "region_type": region_type,
+            "risk_level":       risk_level,
+            "region_type":      region_type,
+            "climate_score":    round(climate_score, 2),
         }
+
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except HTTPException:

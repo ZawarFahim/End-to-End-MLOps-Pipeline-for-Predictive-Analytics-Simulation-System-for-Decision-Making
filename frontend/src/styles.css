@@ -370,6 +370,11 @@ body {
   display: block;
 }
 
+/* Solid red dot markers — sit above map tiles */
+.mapboxgl-marker {
+  z-index: 2;
+}
+
 .mapboxgl-popup-content.globe-popup,
 .globe-popup .mapboxgl-popup-content {
   background: rgba(15,23,42,0.95);

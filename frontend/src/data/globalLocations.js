@@ -109,7 +109,7 @@ const globalLocations = [
   { name: "Rio de Janeiro", lat: -22.91, lng: -43.17, temp: 24, rain: 1200, humidity: 80, N: 82, P: 46, K: 44 },
   { name: "Buenos Aires", lat: -34.61, lng: -58.38, temp: 17, rain: 1220, humidity: 70, N: 80, P: 44, K: 42 },
   { name: "Santiago", lat: -33.46, lng: -70.65, temp: 14, rain: 310, humidity: 60, N: 68, P: 34, K: 32 },
-  { name: "Lima", lat: -12.05, lng: -77.04, temp: 19, rain: 15, humidity: 80, N: 55, P: 24, K: 22 },
+  { name: "La Paz", lat: -16.50, lng: -68.15, temp: 8, rain: 560, humidity: 58, N: 62, P: 28, K: 26 },
   { name: "Montevideo", lat: -34.91, lng: -56.17, temp: 16, rain: 1100, humidity: 74, N: 76, P: 40, K: 38 },
   { name: "Manaus", lat: -3.12, lng: -60.02, temp: 27, rain: 2300, humidity: 85, N: 88, P: 52, K: 50 },
   { name: "Brasilia", lat: -15.78, lng: -47.93, temp: 21, rain: 1550, humidity: 72, N: 82, P: 46, K: 44 },

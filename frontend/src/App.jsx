@@ -246,7 +246,7 @@ export default function App() {
     // ── FIX: classify-yield payload has ONLY 3 fields (no crop_type!) ──
     const classifyPayload = { temperature: temp, rainfall: rain, humidity: hum };
 
-    const yieldPayload = { temperature: temp, rainfall: rain, humidity: hum, crop_type: "Wheat" };
+    const yieldPayload = { lat: city.lat, lon: city.lng, crop_type: "Wheat" };
     const clusterPayload = {
       samples: [{
         rainfall: rain,
@@ -261,12 +261,20 @@ export default function App() {
       const calls = await Promise.allSettled([
         postJson("/predict-yield", yieldPayload),
         postJson("/classify-yield", classifyPayload),   // ← fixed: no crop_type
-        postJson("/forecast", { city: city.name }),
-        postJson("/recommend", {}),
-        postJson("/cluster", clusterPayload)
+        postJson("/forecast", { city: city.name, lat: city.lat, lng: city.lng }),
+        postJson("/recommend", {
+            temperature: temp,
+            rainfall: rain,
+            humidity: hum,
+            n: Number(city?.N ?? 75),
+            p: Number(city?.P ?? 40),
+            k: Number(city?.K ?? 38)
+        }),
+        postJson("/cluster", clusterPayload),
+        postJson("/simulate-climate-risk", yieldPayload)
       ]);
 
-      const [yieldRes, classRes, forecastRes, recommendRes, clusterRes] = calls;
+      const [yieldRes, classRes, forecastRes, recommendRes, clusterRes, simRes] = calls;
 
       const failures = calls
         .filter((r) => r.status === "rejected")
@@ -278,6 +286,7 @@ export default function App() {
       const forecastResp = forecastRes.status === "fulfilled" ? forecastRes.value : null;
       const recommendResp = recommendRes.status === "fulfilled" ? recommendRes.value : null;
       const clusterResp = clusterRes.status === "fulfilled" ? clusterRes.value : null;
+      const simResp = simRes.status === "fulfilled" ? simRes.value : null;
 
       const forecastPoints = Array.isArray(forecastResp?.forecast)
         ? forecastResp.forecast.map((p, i) => {
@@ -292,13 +301,14 @@ export default function App() {
         cropSuitabilityScore: Number(yieldResp?.crop_suitability_score ?? yieldResp?.prediction ?? 0),
         riskLevel: classResp?.risk_level ?? "high",
         regionType: classResp?.region_type ?? getRainRegion(rain),
-        topCrops: classResp?.top_crops ?? [],
+        topCrops: recommendResp?.realistic_recommendations ?? recommendResp?.recommendations ?? classResp?.top_crops ?? [],
         confidenceScores: classResp?.confidence_scores ?? [],
         projectedSuitability: forecastResp?.suitability_projection ?? null,
         rainfallHistory: Array.isArray(forecastResp?.historical) ? forecastResp.historical : [],
         forecast: forecastPoints,
-        recommendation: recommendResp ?? { recommendations: [] },
-        cluster: clusterResp ?? { clusters: [] }
+        recommendation: recommendResp ?? { realistic_recommendations: [] },
+        cluster: clusterResp ?? { clusters: [] },
+        simulation: simResp ?? null
       });
 
       if (failures.length > 0) {
@@ -320,8 +330,9 @@ export default function App() {
         projectedSuitability: null,
         rainfallHistory: [],
         forecast: [],
-        recommendation: { recommendations: [] },
-        cluster: { clusters: [] }
+        recommendation: { realistic_recommendations: [] },
+        cluster: { clusters: [] },
+        simulation: null
       });
     } finally {
       if (requestId === requestSeqRef.current) setLoading(false);
@@ -334,6 +345,10 @@ export default function App() {
     try {
       setSearchLoading(true);
       setSearchError("");
+  const handleSearch = async () => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    try {
       const g = await postJson("/geocode", { query: q });
       setFlyToCoord({ lat: Number(g.lat), lng: Number(g.lng) });
       const fromMarkers = locations.find((c) => c.name.toLowerCase() === String(g.city).toLowerCase());
@@ -449,6 +464,13 @@ export default function App() {
                 <div className="projection-box">
                   <p><strong>Projected next-month score:</strong>{" "}{Number(result.projectedSuitability?.crop_suitability_score ?? 0).toFixed(2)}</p>
                   <p><strong>Projected risk:</strong> {result.projectedSuitability?.risk_level || "—"}</p>
+                </div>
+              )}
+
+              {result?.simulation && (
+                <div className="projection-box">
+                  <p><strong>2050 Simulated Yield (Climate Risk):</strong> {result.simulation.simulated_2050_yield} hg/ha</p>
+                  <p><strong>Yield Change:</strong> <span style={{ color: result.simulation.percentage_change < 0 ? "#f87171" : "#4ade80" }}>{result.simulation.percentage_change}%</span></p>
                 </div>
               )}
 

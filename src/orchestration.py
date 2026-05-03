@@ -132,13 +132,13 @@ def train_rainfall_forecast_task(
 
 @task(name="train_yield_classifier_model")
 def train_classifier_task(
-    csv_path: str = "data/global_agriculture_dataset.csv",
+    csv_path: str = "data/climate_change_impact_on_agriculture_2024.csv",
     output_path: str = "models/classifier.pkl",
     random_state: int = 42,
 ) -> str:
     in_path = Path(csv_path)
     if not in_path.is_file():
-        fallback = Path("data") / "climate_change_impact_on_agriculture_2024.csv"
+        fallback = Path("data") / "global_agriculture_dataset.csv"
         if fallback.is_file():
             in_path = fallback
         else:
@@ -265,7 +265,7 @@ def crop_agri_training_flow(
     clustering_plot_output: str = "models/clusters.png",
     rainfall_forecast_output: str = "models/forecast_model.pkl",
     classifier_output: str = "models/classifier.pkl",
-    classifier_csv_path: str = "data/global_agriculture_dataset.csv",
+    classifier_csv_path: str = "data/climate_change_impact_on_agriculture_2024.csv",
     target_col: str = "label",
     k: int = 3,
     random_state: int = 42,

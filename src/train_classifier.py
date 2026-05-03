@@ -21,10 +21,10 @@ from typing import Any, Iterable
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import KBinsDiscretizer
-from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
 LOG = logging.getLogger("train_classifier")
 
@@ -201,19 +201,22 @@ def train_compare_and_save(
 
     models: list[tuple[str, Any]] = [
         (
-            "LogisticRegression",
-            LogisticRegression(
-                max_iter=2000,
+            "RandomForestClassifier",
+            RandomForestClassifier(
+                n_estimators=200,
+                class_weight="balanced",
                 random_state=random_state,
                 n_jobs=-1,
             ),
         ),
         (
-            "DecisionTreeClassifier",
-            DecisionTreeClassifier(
-                max_depth=12,
-                min_samples_leaf=5,
+            "XGBClassifier",
+            XGBClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
                 random_state=random_state,
+                n_jobs=-1,
             ),
         ),
     ]

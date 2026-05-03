@@ -246,8 +246,15 @@ export default function App() {
       const calls = await Promise.allSettled([
         postJson("/predict-yield", yieldPayload),
         postJson("/classify-yield", classifyPayload),   // ← fixed: no crop_type
-        postJson("/forecast", { city: city.name }),
-        postJson("/recommend", {}),
+        postJson("/forecast", { city: city.name, lat: city.lat, lng: city.lng }),
+        postJson("/recommend", {
+            temperature: temp,
+            rainfall: rain,
+            humidity: hum,
+            n: Number(city?.N ?? 75),
+            p: Number(city?.P ?? 40),
+            k: Number(city?.K ?? 38)
+        }),
         postJson("/cluster", clusterPayload)
       ]);
 
@@ -277,12 +284,12 @@ export default function App() {
         cropSuitabilityScore: Number(yieldResp?.crop_suitability_score ?? yieldResp?.prediction ?? 0),
         riskLevel: classResp?.risk_level ?? "high",
         regionType: classResp?.region_type ?? getRainRegion(rain),
-        topCrops: classResp?.top_crops ?? [],
+        topCrops: recommendResp?.realistic_recommendations ?? recommendResp?.recommendations ?? classResp?.top_crops ?? [],
         confidenceScores: classResp?.confidence_scores ?? [],
         projectedSuitability: forecastResp?.suitability_projection ?? null,
         rainfallHistory: Array.isArray(forecastResp?.historical) ? forecastResp.historical : [],
         forecast: forecastPoints,
-        recommendation: recommendResp ?? { recommendations: [] },
+        recommendation: recommendResp ?? { realistic_recommendations: [] },
         cluster: clusterResp ?? { clusters: [] }
       });
 
@@ -305,7 +312,7 @@ export default function App() {
         projectedSuitability: null,
         rainfallHistory: [],
         forecast: [],
-        recommendation: { recommendations: [] },
+        recommendation: { realistic_recommendations: [] },
         cluster: { clusters: [] }
       });
     } finally {

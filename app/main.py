@@ -81,6 +81,8 @@ class YieldRequest(BaseModel):
 class ForecastRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     city: str = Field(..., min_length=1)
+    lat: float | None = None
+    lng: float | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -224,7 +226,26 @@ def _yield_request_to_pipeline_frame(data: YieldRequest) -> pd.DataFrame:
     return pd.DataFrame([row])[expected_cols]
 
 
-def _forecast_three_values(city: str) -> list[float]:
+import httpx
+
+async def _forecast_three_values(city: str, lat: float | None = None, lng: float | None = None) -> list[float]:
+    if lat is not None and lng is not None:
+        try:
+            # Fetch dynamic real weather forecast from Open-Meteo
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&daily=precipitation_sum&timezone=auto&past_days=0"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    daily = data.get("daily", {})
+                    precip = daily.get("precipitation_sum", [])
+                    # Return next 3 days
+                    if len(precip) >= 3:
+                        return [float(x) if x is not None else 0.0 for x in precip[:3]]
+        except Exception as e:
+            LOG.warning(f"Open-Meteo fetch failed for {lat},{lng}: {e}")
+            pass # Fallback to artifact
+
     artifact = get_forecast_artifact()
     city_key = city.strip().lower()
     city_models = artifact.get("models") or artifact.get("city_models") or {}
@@ -355,7 +376,7 @@ async def predict_yield(data: YieldRequest) -> dict[str, Any]:
         model = artifact["model"]
         df = _yield_request_to_pipeline_frame(data)
         prediction = model.predict(df)
-        val = float(prediction[0])
+        val = max(0.0, float(prediction[0]))
         LOG.info("/predict-yield success val=%.4f", val)
         return {
             "prediction": val,
@@ -485,7 +506,7 @@ async def forecast(data: ForecastRequest) -> dict[str, Any]:
         city = data.city.strip()
         if not city:
             raise ValueError("city is required")
-        forecast_values = _forecast_three_values(city)
+        forecast_values = await _forecast_three_values(city, data.lat, data.lng)
         LOG.info("/forecast success for %s", city)
         return {"city": city, "forecast": [float(v) for v in forecast_values]}
     except FileNotFoundError as exc:
@@ -528,9 +549,64 @@ def cluster(request: ClusterRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Clustering failed: {exc}") from exc
 
 
+class RecommendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    temperature: float = 25.0
+    rainfall: float = 500.0
+    humidity: float = 60.0
+    n: float = 70.0
+    p: float = 40.0
+    k: float = 40.0
+
 @app.post("/recommend")
-async def recommend() -> dict[str, Any]:
-    return {"recommendations": ["Wheat", "Rice", "Maize"]}
+async def recommend(data: RecommendRequest) -> dict[str, Any]:
+    try:
+        region_type = _derive_region_type(data.rainfall)
+        artifact = get_recommender_artifact() if "get_recommender_artifact" in globals() else _safe_load_artifact(RECOMMENDER_MODEL_PATH, "recommender")
+        if artifact is None or "model" not in artifact:
+            raise ValueError("Recommender model not available")
+        
+        model = artifact["model"]
+        X = pd.DataFrame([{
+            "N": data.n,
+            "P": data.p,
+            "K": data.k,
+            "temperature": data.temperature,
+            "humidity": data.humidity,
+            "ph": 6.5,
+            "rainfall": data.rainfall
+        }])
+        
+        feat_cols = artifact.get("feature_columns", ["N", "P", "K", "temperature", "humidity", "ph", "rainfall"])
+        for c in feat_cols:
+            if c not in X.columns:
+                X[c] = 0.0
+        X = X[feat_cols]
+        
+        proba = model.predict_proba(X)[0]
+        classes = list(getattr(model, "classes_", artifact.get("classes", [])))
+        if not classes:
+            classes = model.classes_
+            
+        all_ranked = sorted(zip(classes, proba), key=lambda x: float(x[1]), reverse=True)
+        
+        region_map = getattr(artifact, "region_crop_map", _DEFAULT_REGION_CROP_MAP)
+        allowed = region_map.get(region_type, [])
+        filtered = [c for c, p in all_ranked if c in allowed]
+        
+        if not filtered:
+            filtered = [c for c, p in all_ranked]
+            
+        return {
+            "region_classification": region_type,
+            "realistic_recommendations": filtered[:3]
+        }
+    except Exception as exc:
+        LOG.exception("/recommend failed")
+        return {
+            "region_classification": "unknown",
+            "realistic_recommendations": ["Wheat", "Rice", "Maize"]
+        }
 
 
 if __name__ == "__main__":

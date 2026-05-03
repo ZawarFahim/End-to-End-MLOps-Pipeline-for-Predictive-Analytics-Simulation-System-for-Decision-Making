@@ -218,7 +218,9 @@ def _yield_request_to_pipeline_frame(data: YieldRequest) -> pd.DataFrame:
         "K": 50.0,
         "Soil_Quality": 50.0,
     }
-    _ = data.rainfall
+    row["Rainfall"] = data.rainfall
+    if "Rainfall" not in expected_cols:
+        expected_cols.append("Rainfall")
     return pd.DataFrame([row])[expected_cols]
 
 
@@ -390,7 +392,7 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         # ── Derived features ──────────────────────────────────────────────
         region_type   = _derive_region_type(data.rainfall)
         climate_score = _compute_climate_score(
-            data.temperature, data.rainfall, data.humidity
+            data.temperature, data.humidity, data.rainfall
         )
         LOG.info("Region: %s  climate_score: %.2f", region_type, climate_score)
 
@@ -451,7 +453,7 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         total = sum(float(p) for _, p in top3) or 1.0
         top_crops        = [str(c) for c, _ in top3]
         confidence_scores = [round(float(p) / total, 4) for _, p in top3]
-        max_prob         = confidence_scores[0] if confidence_scores else 0.0
+        max_prob         = float(top3[0][1]) if top3 else 0.0
         risk_level       = _risk_from_probability(max_prob)
 
         LOG.info(

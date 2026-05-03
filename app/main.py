@@ -39,6 +39,50 @@ CLUSTER_MODEL_PATH = MODELS_DIR / "clustering.pkl"
 RECOMMENDER_MODEL_PATH = MODELS_DIR / "crop_recommender.pkl"
 METRICS_HISTORY_PATH = MODELS_DIR / "metrics_history.json"
 
+CLIMATE_RULES = {
+    "wheat": {"temp": (10, 30), "rainfall": (200, 800)},
+    "rice": {"temp": (20, 35), "rainfall": (800, 2000)},
+    "cotton": {"temp": (20, 40), "rainfall": (300, 900)},
+    "maize": {"temp": (15, 35), "rainfall": (300, 1200)},
+    "sugarcane": {"temp": (20, 35), "rainfall": (600, 1500)},
+    "coffee": {"temp": (18, 25), "rainfall": (1200, 2500)},
+}
+
+_LOCATIONS_DF: pd.DataFrame | None = None
+try:
+    _loc_path = Path("data") / "GlobalWeatherRepository.csv"
+    if _loc_path.is_file():
+        _LOCATIONS_DF = pd.read_csv(
+            _loc_path,
+            usecols=["country", "location_name", "latitude", "longitude"],
+            low_memory=False,
+        ).dropna()
+except Exception:
+    _LOCATIONS_DF = None
+
+_FEATURE_DEFAULTS = {
+    "soil_type": "Loamy",
+    "soil_ph": 6.5,
+    "wind_speed": 5.0,
+    "n": 50.0,
+    "p": 50.0,
+    "k": 50.0,
+    "soil_quality": 50.0,
+}
+try:
+    _yield_path = Path("data") / "crop_yield_dataset.csv"
+    if _yield_path.is_file():
+        _df_defaults = pd.read_csv(_yield_path, low_memory=False)
+        if "Soil_Type" in _df_defaults.columns:
+            mode = _df_defaults["Soil_Type"].dropna().astype(str).mode()
+            if not mode.empty:
+                _FEATURE_DEFAULTS["soil_type"] = mode.iloc[0]
+        for src, key in [("Soil_pH", "soil_ph"), ("Wind_Speed", "wind_speed"), ("N", "n"), ("P", "p"), ("K", "k"), ("Soil_Quality", "soil_quality")]:
+            if src in _df_defaults.columns:
+                _FEATURE_DEFAULTS[key] = float(pd.to_numeric(_df_defaults[src], errors="coerce").dropna().mean())
+except Exception:
+    pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.artifacts = {
@@ -89,6 +133,11 @@ class ClassifyRequest(BaseModel):
     temperature: float
     rainfall: float
     humidity: float
+
+
+class GeocodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(..., min_length=1)
 
 
 class ClusterRequest(BaseModel):
@@ -210,15 +259,17 @@ def _yield_request_to_pipeline_frame(data: YieldRequest) -> pd.DataFrame:
         "Crop_Type": data.crop_type,
         "Temperature": data.temperature,
         "Humidity": data.humidity,
-        "Soil_Type": "Loamy",
-        "Soil_pH": 6.5,
-        "Wind_Speed": 5.0,
-        "N": 50.0,
-        "P": 50.0,
-        "K": 50.0,
-        "Soil_Quality": 50.0,
+        "Soil_Type": _FEATURE_DEFAULTS["soil_type"],
+        "Soil_pH": _FEATURE_DEFAULTS["soil_ph"],
+        "Wind_Speed": _FEATURE_DEFAULTS["wind_speed"],
+        "N": _FEATURE_DEFAULTS["n"],
+        "P": _FEATURE_DEFAULTS["p"],
+        "K": _FEATURE_DEFAULTS["k"],
+        "Soil_Quality": _FEATURE_DEFAULTS["soil_quality"],
     }
-    _ = data.rainfall
+    row["Rainfall"] = data.rainfall
+    if "Rainfall" not in expected_cols:
+        expected_cols.append("Rainfall")
     return pd.DataFrame([row])[expected_cols]
 
 
@@ -295,6 +346,28 @@ def _risk_from_probability(max_prob: float) -> str:
     if max_prob >= 0.4:
         return "medium"
     return "high"
+
+
+def _climate_in_range(crop: str, temperature: float, rainfall: float) -> bool:
+    rule = CLIMATE_RULES.get(crop.lower())
+    if rule is None:
+        return True
+    tmin, tmax = rule["temp"]
+    rmin, rmax = rule["rainfall"]
+    return (tmin <= temperature <= tmax) and (rmin <= rainfall <= rmax)
+
+
+def _weather_score_for_crop(crop: str, temperature: float, rainfall: float) -> int:
+    rule = CLIMATE_RULES.get(crop.lower())
+    if rule is None:
+        return 60
+    tmin, tmax = rule["temp"]
+    rmin, rmax = rule["rainfall"]
+    t_mid = (tmin + tmax) / 2.0
+    r_mid = (rmin + rmax) / 2.0
+    t_pen = min(abs(temperature - t_mid) * 4.0, 50.0)
+    r_pen = min(abs(rainfall - r_mid) / 30.0, 50.0)
+    return int(max(0.0, 100.0 - t_pen - r_pen))
 
 
 
@@ -390,7 +463,7 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         # ── Derived features ──────────────────────────────────────────────
         region_type   = _derive_region_type(data.rainfall)
         climate_score = _compute_climate_score(
-            data.temperature, data.rainfall, data.humidity
+            data.temperature, data.humidity, data.rainfall
         )
         LOG.info("Region: %s  climate_score: %.2f", region_type, climate_score)
 
@@ -430,20 +503,27 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         all_ranked = sorted(zip(classes, proba), key=lambda x: float(x[1]), reverse=True)
         LOG.info("Raw top-5: %s", [(c, round(float(p), 3)) for c, p in all_ranked[:5]])
 
-        # ── Region constraint filter ──────────────────────────────────────
-        region_map: dict[str, list[str]] = artifact.get(
-            "region_crop_map", _DEFAULT_REGION_CROP_MAP
-        )
-        allowed: list[str] = region_map.get(region_type, [])
+        # ── Climate filter FIRST (strict) ─────────────────────────────────
+        climate_filtered = [
+            (str(c), float(p))
+            for c, p in all_ranked
+            if _climate_in_range(str(c), float(data.temperature), float(data.rainfall))
+        ]
+        if not climate_filtered:
+            # inject expanded crop fallback if model classes are missing/invalid for climate
+            climate_filtered = [(crop.lower(), 0.01) for crop in CLIMATE_RULES.keys() if _climate_in_range(crop, float(data.temperature), float(data.rainfall))]
 
-        filtered = [(c, p) for c, p in all_ranked if c in allowed]
+        # ── Region filter SECOND ───────────────────────────────────────────
+        region_map: dict[str, list[str]] = artifact.get("region_crop_map", _DEFAULT_REGION_CROP_MAP)
+        allowed: list[str] = [c.lower() for c in region_map.get(region_type, [])]
+        filtered = [(c, p) for c, p in climate_filtered if c.lower() in allowed]
         LOG.info("Filtered (%s): %s", region_type,
                  [(c, round(float(p), 3)) for c, p in filtered[:5]])
 
-        # Fallback: if constraint removes everything use raw predictions
+        # Fallback: if region filter removes everything, keep climate-safe candidates
         if not filtered:
-            LOG.warning("Region filter removed all crops — using raw predictions (fallback)")
-            filtered = all_ranked
+            LOG.warning("Region filter removed all crops — using climate-safe predictions (fallback)")
+            filtered = climate_filtered
 
         top3 = filtered[:3]
 
@@ -451,7 +531,7 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         total = sum(float(p) for _, p in top3) or 1.0
         top_crops        = [str(c) for c, _ in top3]
         confidence_scores = [round(float(p) / total, 4) for _, p in top3]
-        max_prob         = confidence_scores[0] if confidence_scores else 0.0
+        max_prob         = float(top3[0][1]) if top3 else 0.0
         risk_level       = _risk_from_probability(max_prob)
 
         LOG.info(
@@ -459,12 +539,24 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
             top_crops[0], risk_level, region_type,
         )
 
+        top_objs = [{"name": c.title(), "confidence": round(confidence_scores[i], 4)} for i, c in enumerate(top_crops)]
+        top_conf = confidence_scores[0] if confidence_scores else 0.0
+        if top_conf < 0.4:
+            summary = "No strong crop recommendation for current conditions"
+        elif top_conf < 0.7:
+            summary = f"Moderately suitable for {top_crops[0].title()}"
+        else:
+            summary = f"Ideal for {top_crops[0].title()} under current conditions"
+        insights = {"summary": summary, "warnings": ["Low rainfall"] if float(data.rainfall) < 300 else []}
         return {
-            "top_crops":        top_crops,
+            "top_crops": top_crops,
             "confidence_scores": confidence_scores,
-            "risk_level":       risk_level,
-            "region_type":      region_type,
-            "climate_score":    round(climate_score, 2),
+            "top_crops_detailed": top_objs,
+            "risk_level": risk_level,
+            "region_type": region_type,
+            "climate_score": round(climate_score, 2),
+            "weather_score": _weather_score_for_crop(top_crops[0] if top_crops else "", float(data.temperature), float(data.rainfall)),
+            "insights": insights,
         }
 
     except FileNotFoundError as exc:
@@ -524,6 +616,32 @@ def cluster(request: ClusterRequest) -> dict[str, Any]:
     except Exception as exc:
         LOG.exception("/cluster failed")
         raise HTTPException(status_code=400, detail=f"Clustering failed: {exc}") from exc
+
+
+@app.post("/geocode")
+def geocode(data: GeocodeRequest) -> dict[str, Any]:
+    q = data.query.strip().lower()
+    if not q:
+        raise HTTPException(status_code=422, detail="query is required")
+    if _LOCATIONS_DF is None:
+        raise HTTPException(status_code=404, detail="No location dataset available")
+    city = _LOCATIONS_DF["location_name"].astype(str).str.lower()
+    country = _LOCATIONS_DF["country"].astype(str).str.lower()
+
+    exact = _LOCATIONS_DF[(city == q) | (country == q)]
+    startswith = _LOCATIONS_DF[city.str.startswith(q) | country.str.startswith(q)]
+    contains = _LOCATIONS_DF[city.str.contains(q) | country.str.contains(q)]
+
+    if not exact.empty:
+        m = exact
+    elif not startswith.empty:
+        m = startswith
+    elif not contains.empty:
+        m = contains
+    else:
+        raise HTTPException(status_code=404, detail=f"No match for query: {data.query}")
+    r = m.iloc[0]
+    return {"lat": float(r["latitude"]), "lng": float(r["longitude"]), "city": str(r["location_name"])}
 
 
 @app.post("/recommend")

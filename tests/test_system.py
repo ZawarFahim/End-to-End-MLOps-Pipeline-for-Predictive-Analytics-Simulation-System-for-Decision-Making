@@ -25,7 +25,7 @@ def _artifact_ready(key: str) -> bool:
 def test_root_health():
     r = client.get("/")
     assert r.status_code == 200
-    assert r.json().get("message") == "ML API running"
+    assert r.json().get("message") == "Agricultural Intelligence API v2.0 running"
 
 
 def test_metrics_endpoint():

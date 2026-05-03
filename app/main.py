@@ -10,6 +10,8 @@ import joblib
 import numpy as np
 import pandas as pd
 import uvicorn
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,7 +31,30 @@ def _configure_logging() -> None:
 _configure_logging()
 LOG = logging.getLogger("ml_api")
 
-app = FastAPI(title="MLOps Agricultural Intelligence API", version="2.0.0")
+MODELS_DIR = Path("models")
+YIELD_MODEL_PATH = MODELS_DIR / "yield_model.pkl"
+CLASSIFIER_MODEL_PATH = MODELS_DIR / "classifier.pkl"
+FORECAST_MODEL_PATH = MODELS_DIR / "forecast_model.pkl"
+CLUSTER_MODEL_PATH = MODELS_DIR / "clustering.pkl"
+RECOMMENDER_MODEL_PATH = MODELS_DIR / "crop_recommender.pkl"
+METRICS_HISTORY_PATH = MODELS_DIR / "metrics_history.json"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.artifacts = {
+        "yield": _safe_load_artifact(YIELD_MODEL_PATH, "yield"),
+        "classifier": _safe_load_artifact(CLASSIFIER_MODEL_PATH, "classifier"),
+        "forecast": _safe_load_artifact(FORECAST_MODEL_PATH, "forecast"),
+        "cluster": _safe_load_artifact(CLUSTER_MODEL_PATH, "cluster"),
+        "recommender": _safe_load_artifact(RECOMMENDER_MODEL_PATH, "recommender"),
+    }
+    available = [name for name, a in app.state.artifacts.items() if a is not None]
+    LOG.info("Startup complete. Available artifacts: %s", available)
+    if app.state.artifacts.get("classifier") is None:
+        LOG.error("CRITICAL: Classifier model missing at startup: %s", CLASSIFIER_MODEL_PATH)
+    yield
+
+app = FastAPI(title="MLOps Agricultural Intelligence API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,14 +63,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-MODELS_DIR = Path("models")
-YIELD_MODEL_PATH = MODELS_DIR / "yield_model.pkl"
-CLASSIFIER_MODEL_PATH = MODELS_DIR / "classifier.pkl"
-FORECAST_MODEL_PATH = MODELS_DIR / "forecast_model.pkl"
-CLUSTER_MODEL_PATH = MODELS_DIR / "clustering.pkl"
-RECOMMENDER_MODEL_PATH = MODELS_DIR / "crop_recommender.pkl"
-METRICS_HISTORY_PATH = MODELS_DIR / "metrics_history.json"
 
 
 # ---------------------------------------------------------------------------
@@ -280,24 +297,7 @@ def _risk_from_probability(max_prob: float) -> str:
     return "high"
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 
-
-@app.on_event("startup")
-def preload_models() -> None:
-    app.state.artifacts = {
-        "yield": _safe_load_artifact(YIELD_MODEL_PATH, "yield"),
-        "classifier": _safe_load_artifact(CLASSIFIER_MODEL_PATH, "classifier"),
-        "forecast": _safe_load_artifact(FORECAST_MODEL_PATH, "forecast"),
-        "cluster": _safe_load_artifact(CLUSTER_MODEL_PATH, "cluster"),
-        "recommender": _safe_load_artifact(RECOMMENDER_MODEL_PATH, "recommender"),
-    }
-    available = [name for name, a in app.state.artifacts.items() if a is not None]
-    LOG.info("Startup complete. Available artifacts: %s", available)
-    if app.state.artifacts.get("classifier") is None:
-        LOG.error("CRITICAL: Classifier model missing at startup: %s", CLASSIFIER_MODEL_PATH)
 
 
 # ---------------------------------------------------------------------------

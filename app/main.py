@@ -13,6 +13,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from app.weather_api import get_real_world_weather
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from statsmodels.tsa.arima.model import ARIMA
@@ -76,6 +77,12 @@ class YieldRequest(BaseModel):
     rainfall: float
     humidity: float
     crop_type: str = Field(..., min_length=1)
+
+
+class GeoRequest(BaseModel):
+    lat: float
+    lon: float
+    crop_type: str = "Wheat"
 
 
 class ForecastRequest(BaseModel):
@@ -369,17 +376,47 @@ def metrics_history() -> dict[str, Any]:
 
 
 @app.post("/predict-yield")
-async def predict_yield(data: YieldRequest) -> dict[str, Any]:
+async def predict_yield_geo(data: GeoRequest) -> dict[str, Any]:
+    """Fetches real NASA weather for the clicked coordinates, then predicts yield."""
     LOG.info("/predict-yield payload: %s", data.model_dump())
     try:
+        # 1. Fetch live NASA data using the clicked coordinates
+        live_weather = get_real_world_weather(data.lat, data.lon)
+        
+        # 2. Load your newly fixed TransformedTargetRegressor model
         artifact = get_yield_artifact()
         model = artifact["model"]
-        df = _yield_request_to_pipeline_frame(data)
-        prediction = model.predict(df)
-        val = max(0.0, float(prediction[0]))
+        
+        # 3. Create the input dataframe with all expected columns
+        expected_cols = [
+            "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
+            "Wind_Speed", "N", "P", "K", "Soil_Quality",
+        ]
+        row = {
+            "Crop_Type": data.crop_type,
+            "Temperature": live_weather["temperature"],
+            "Humidity": live_weather["humidity"],
+            "Soil_Type": "Loamy",
+            "Soil_pH": 6.5,
+            "Wind_Speed": 5.0,
+            "N": 50.0,
+            "P": 50.0,
+            "K": 50.0,
+            "Soil_Quality": 50.0,
+        }
+        # Note: live_weather["rainfall"] is fetched but this specific model might not use it directly 
+        # (based on the expected_cols). We keep it for the response.
+        df = pd.DataFrame([row])[expected_cols]
+        
+        # 4. Predict the yield
+        predicted_yield = model.predict(df)[0]
+        val = max(0.0, float(predicted_yield))
+        
         LOG.info("/predict-yield success val=%.4f", val)
         return {
-            "prediction": val,
+            "coordinates": {"lat": data.lat, "lon": data.lon},
+            "live_weather": live_weather,
+            "predicted_yield_hg_ha": val,
             "crop_suitability_score": val,
             "risk_level": "low" if val > 0 else "high",
         }
@@ -390,6 +427,57 @@ async def predict_yield(data: YieldRequest) -> dict[str, Any]:
     except Exception as exc:
         LOG.exception("/predict-yield failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/simulate-climate-risk")
+async def simulate_climate_risk(data: GeoRequest):
+    """Simulates 2050 climate conditions and predicts harvest drops."""
+    try:
+        # 1. Get baseline weather
+        baseline_weather = get_real_world_weather(data.lat, data.lon)
+        
+        # 2. Apply 2050 Climate Change Shifts (e.g., +2.5C temp, -15% rainfall)
+        simulated_weather = {
+            "temperature": round(baseline_weather["temperature"] + 2.5, 2),
+            "rainfall": round(baseline_weather["rainfall"] * 0.85, 2),
+            "humidity": round(baseline_weather["humidity"] * 0.90, 2)
+        }
+        
+        # 3. Predict Yield for BOTH scenarios to compare
+        artifact = get_yield_artifact()
+        model = artifact["model"]
+        
+        expected_cols = [
+            "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
+            "Wind_Speed", "N", "P", "K", "Soil_Quality",
+        ]
+        row_base = {
+            "Crop_Type": data.crop_type,
+            "Temperature": baseline_weather["temperature"],
+            "Humidity": baseline_weather["humidity"],
+            "Soil_Type": "Loamy", "Soil_pH": 6.5, "Wind_Speed": 5.0,
+            "N": 50.0, "P": 50.0, "K": 50.0, "Soil_Quality": 50.0,
+        }
+        row_sim = row_base.copy()
+        row_sim["Temperature"] = simulated_weather["temperature"]
+        row_sim["Humidity"] = simulated_weather["humidity"]
+        
+        df_base = pd.DataFrame([row_base])[expected_cols]
+        df_sim = pd.DataFrame([row_sim])[expected_cols]
+        
+        yield_base = float(model.predict(df_base)[0])
+        yield_sim = float(model.predict(df_sim)[0])
+        
+        return {
+            "status": "Simulation Complete",
+            "year": 2050,
+            "baseline_yield": round(yield_base, 2),
+            "simulated_2050_yield": round(yield_sim, 2),
+            "percentage_change": round(((yield_sim - yield_base) / yield_base) * 100, 2) if yield_base else 0.0,
+            "simulated_weather": simulated_weather
+        }
+    except Exception as e:
+        LOG.exception("/simulate-climate-risk failed")
+        return {"error": str(e)}
 
 
 @app.post("/classify-yield")

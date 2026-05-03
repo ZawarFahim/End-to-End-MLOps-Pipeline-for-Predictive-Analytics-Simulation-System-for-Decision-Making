@@ -231,7 +231,7 @@ export default function App() {
     // ── FIX: classify-yield payload has ONLY 3 fields (no crop_type!) ──
     const classifyPayload = { temperature: temp, rainfall: rain, humidity: hum };
 
-    const yieldPayload = { temperature: temp, rainfall: rain, humidity: hum, crop_type: "Wheat" };
+    const yieldPayload = { lat: city.lat, lon: city.lng, crop_type: "Wheat" };
     const clusterPayload = {
       samples: [{
         rainfall: rain,
@@ -255,10 +255,11 @@ export default function App() {
             p: Number(city?.P ?? 40),
             k: Number(city?.K ?? 38)
         }),
-        postJson("/cluster", clusterPayload)
+        postJson("/cluster", clusterPayload),
+        postJson("/simulate-climate-risk", yieldPayload)
       ]);
 
-      const [yieldRes, classRes, forecastRes, recommendRes, clusterRes] = calls;
+      const [yieldRes, classRes, forecastRes, recommendRes, clusterRes, simRes] = calls;
 
       const failures = calls
         .filter((r) => r.status === "rejected")
@@ -270,6 +271,7 @@ export default function App() {
       const forecastResp = forecastRes.status === "fulfilled" ? forecastRes.value : null;
       const recommendResp = recommendRes.status === "fulfilled" ? recommendRes.value : null;
       const clusterResp = clusterRes.status === "fulfilled" ? clusterRes.value : null;
+      const simResp = simRes.status === "fulfilled" ? simRes.value : null;
 
       const forecastPoints = Array.isArray(forecastResp?.forecast)
         ? forecastResp.forecast.map((p, i) => {
@@ -290,7 +292,8 @@ export default function App() {
         rainfallHistory: Array.isArray(forecastResp?.historical) ? forecastResp.historical : [],
         forecast: forecastPoints,
         recommendation: recommendResp ?? { realistic_recommendations: [] },
-        cluster: clusterResp ?? { clusters: [] }
+        cluster: clusterResp ?? { clusters: [] },
+        simulation: simResp ?? null
       });
 
       if (failures.length > 0) {
@@ -313,7 +316,8 @@ export default function App() {
         rainfallHistory: [],
         forecast: [],
         recommendation: { realistic_recommendations: [] },
-        cluster: { clusters: [] }
+        cluster: { clusters: [] },
+        simulation: null
       });
     } finally {
       if (requestId === requestSeqRef.current) setLoading(false);
@@ -418,6 +422,13 @@ export default function App() {
                 <div className="projection-box">
                   <p><strong>Projected next-month score:</strong>{" "}{Number(result.projectedSuitability?.crop_suitability_score ?? 0).toFixed(2)}</p>
                   <p><strong>Projected risk:</strong> {result.projectedSuitability?.risk_level || "—"}</p>
+                </div>
+              )}
+
+              {result?.simulation && (
+                <div className="projection-box">
+                  <p><strong>2050 Simulated Yield (Climate Risk):</strong> {result.simulation.simulated_2050_yield} hg/ha</p>
+                  <p><strong>Yield Change:</strong> <span style={{ color: result.simulation.percentage_change < 0 ? "#f87171" : "#4ade80" }}>{result.simulation.percentage_change}%</span></p>
                 </div>
               )}
 

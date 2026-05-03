@@ -6,8 +6,8 @@ then trains LogisticRegression and DecisionTreeClassifier, compares test
 Accuracy and weighted F1, saves the best model to models/classifier.pkl.
 
 Usage:
-    python src/preprocess.py --csv data/crop_yield_dataset.csv --target Crop_Yield --regression --drop-cols Date
-    python src/train_classifier.py --processed data/processed_data.csv --target Crop_Yield
+    python src/build_master_dataset.py --output data/master_dataset.csv
+    python src/train_classifier.py --csv data/master_dataset.csv --target crop_yield
 """
 
 from __future__ import annotations
@@ -21,14 +21,20 @@ from typing import Any, Iterable
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import KBinsDiscretizer
-from xgboost import XGBClassifier
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 LOG = logging.getLogger("train_classifier")
 
-PROCESSED_DEFAULT = Path("data") / "processed_data.csv"
+CSV_DEFAULT = Path("data") / "master_dataset.csv"
 MODEL_PATH = Path("models") / "classifier.pkl"
 
 CLASS_LABELS = ("low", "medium", "high")
@@ -52,52 +58,15 @@ def _configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
 
 
-def load_processed(path: Path) -> pd.DataFrame:
-    LOG.info("Loading processed dataset from %s", path.resolve())
+def load_master(path: Path, target_column: str) -> pd.DataFrame:
+    LOG.info("Loading master dataset from %s", path.resolve())
     if not path.is_file():
-        raise FileNotFoundError(
-            f"Processed file not found: {path}. Run src/preprocess.py first "
-            "(with --regression and a numeric yield column)."
-        )
+        raise FileNotFoundError(f"Master dataset not found: {path}. Run src/build_master_dataset.py first.")
     df = pd.read_csv(path)
+    if target_column not in df.columns:
+        raise ValueError(f"Target {target_column!r} not in columns: {list(df.columns)}")
     LOG.info("Loaded shape: %s rows, %s columns", df.shape[0], df.shape[1])
     return df
-
-
-def _feature_target_split(
-    df: pd.DataFrame, target_column: str
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    if "dataset_split" not in df.columns:
-        raise ValueError("Expected column 'dataset_split' (train/test) in processed CSV.")
-    if target_column not in df.columns:
-        raise ValueError(
-            f"Target {target_column!r} not in columns: {list(df.columns)}. "
-            "Use --target to match the numeric yield column in processed CSV."
-        )
-
-    enc = f"{target_column}_encoded"
-    drop_cols = {"dataset_split", target_column, enc}
-    drop_present = [c for c in drop_cols if c in df.columns]
-    X = df.drop(columns=drop_present)
-    y = df[target_column].astype(float)
-
-    train_mask = df["dataset_split"].astype(str).str.lower() == "train"
-    test_mask = df["dataset_split"].astype(str).str.lower() == "test"
-    if not train_mask.any() or not test_mask.any():
-        raise ValueError(
-            "dataset_split must include both 'train' and 'test' rows "
-            f"(got counts: {df['dataset_split'].value_counts().to_dict()})."
-        )
-
-    X_train, X_test = X.loc[train_mask], X.loc[test_mask]
-    y_train, y_test = y.loc[train_mask], y.loc[test_mask]
-    LOG.info(
-        "Train rows: %d, test rows: %d, features: %d",
-        len(X_train),
-        len(X_test),
-        X_train.shape[1],
-    )
-    return X_train, X_test, y_train, y_test
 
 
 def _yield_to_categories(
@@ -190,41 +159,92 @@ def _pick_best(
 
 
 def train_compare_and_save(
-    processed_path: Path,
+    csv_path: Path,
     yield_column: str,
     model_path: Path,
     random_state: int,
 ) -> Path:
-    df = load_processed(processed_path)
-    X_train, X_test, y_train_cont, y_test_cont = _feature_target_split(df, yield_column)
+    df = load_master(csv_path, yield_column)
+
+    categorical = [c for c in ["country", "region", "crop_type"] if c in df.columns]
+    numeric = [c for c in ["temperature", "rainfall", "humidity", "N", "P", "K", "ph"] if c in df.columns]
+    feature_cols = numeric + categorical
+    if not feature_cols:
+        raise ValueError("No usable feature columns found in master dataset.")
+
+    X = df[feature_cols].copy()
+    y_cont = pd.to_numeric(df[yield_column], errors="coerce").astype(float)
+    mask = y_cont.notna()
+    X = X.loc[mask].copy()
+    y_cont = y_cont.loc[mask].copy()
+
+    X_train_raw, X_test_raw, y_train_cont, y_test_cont = train_test_split(
+        X, y_cont, test_size=0.2, random_state=random_state
+    )
     y_train, y_test, binner = _yield_to_categories(y_train_cont, y_test_cont, random_state)
 
-    models: list[tuple[str, Any]] = [
-        (
-            "RandomForestClassifier",
-            RandomForestClassifier(
-                n_estimators=200,
-                class_weight="balanced",
-                random_state=random_state,
-                n_jobs=-1,
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                numeric,
             ),
-        ),
-        (
-            "XGBClassifier",
-            XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=random_state,
-                n_jobs=-1,
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical,
             ),
-        ),
-    ]
+        ],
+        remainder="drop",
+    )
+
+    rf = RandomForestClassifier(
+        random_state=random_state,
+        class_weight="balanced",
+        n_jobs=1,
+    )
+    rf_pipe = ImbPipeline(
+        steps=[
+            ("preprocess", preprocessor),
+            ("smote", SMOTE(random_state=random_state)),
+            ("model", rf),
+        ]
+    )
+
+    # Random search tuned for weighted F1.
+    rf_search = RandomizedSearchCV(
+        estimator=rf_pipe,
+        param_distributions={
+            "model__n_estimators": [300, 500, 800],
+            "model__max_depth": [None, 6, 10, 14],
+            "model__min_samples_leaf": [1, 2, 4, 6],
+            "model__min_samples_split": [2, 5, 10],
+            "model__max_features": ["sqrt", "log2", None],
+        },
+        n_iter=6,
+        scoring="f1_weighted",
+        cv=3,
+        random_state=random_state,
+        n_jobs=1,
+        refit=True,
+        verbose=1,
+    )
 
     LOG.info("Fitting and evaluating classifiers (test metrics use held-out split)")
     results: list[tuple[str, Any, dict[str, float]]] = []
-    for name, est in models:
-        metrics = _evaluate(name, est, X_train, X_test, y_train, y_test)
+    for name, est in [("RandomForestClassifier (tuned)", rf_search)]:
+        metrics = _evaluate(name, est, X_train_raw, X_test_raw, y_train, y_test)
         results.append((name, est, metrics))
 
     best_name, best_model, best_metrics = _pick_best(results)
@@ -245,11 +265,12 @@ def train_compare_and_save(
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     artifact = {
-        "model": best_model,
+        "model": getattr(best_model, "best_estimator_", best_model),
         "model_name": best_name,
         "yield_column": yield_column,
         "class_labels": list(CLASS_LABELS),
         "yield_binner": binner,
+        "feature_columns": feature_cols,
         "metrics": {name: dict(m) for name, _, m in results},
         "best_metrics": dict(best_metrics),
     }
@@ -260,13 +281,13 @@ def train_compare_and_save(
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train yield category classifiers on processed_data.csv")
-    p.add_argument("--processed", type=Path, default=PROCESSED_DEFAULT, help="Processed CSV path")
+    p.add_argument("--csv", type=Path, default=CSV_DEFAULT, help="Master CSV path")
     p.add_argument(
         "--target",
         type=str,
-        default="Crop_Yield",
+        default="crop_yield",
         dest="yield_column",
-        help="Numeric yield column in processed CSV (default: Crop_Yield)",
+        help="Numeric yield column in master CSV (default: crop_yield)",
     )
     p.add_argument("--output", type=Path, default=MODEL_PATH, help="Output joblib path")
     p.add_argument("--random-state", type=int, default=42, help="Random seed")
@@ -277,7 +298,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     _configure_logging()
     args = parse_args(argv)
     train_compare_and_save(
-        processed_path=args.processed,
+        csv_path=args.csv,
         yield_column=args.yield_column,
         model_path=args.output,
         random_state=args.random_state,

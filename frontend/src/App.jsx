@@ -148,10 +148,7 @@ export default function App() {
   const [metricsHistory, setMetricsHistory] = useState([]);
   const [metricsRefreshedAt, setMetricsRefreshedAt] = useState("");
   const requestSeqRef = useRef(0);
-  const [searchQuery, setSearchQuery] = useState("");
   const [flyToCoord, setFlyToCoord] = useState(null);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState("");
   const locations = useMemo(() => globalLocations, []);
 
   const fetchModelHealth = async () => {
@@ -339,29 +336,6 @@ export default function App() {
     }
   };
 
-  const handleSearch = useCallback(async (queryOverride = null) => {
-    const q = String(queryOverride ?? searchQuery).trim();
-    if (!q) return;
-    try {
-      setSearchLoading(true);
-      setSearchError("");
-      const g = await postJson("/geocode", { query: q });
-      setFlyToCoord({ lat: Number(g.lat), lng: Number(g.lng) });
-      const fromMarkers = locations.find((c) => c.name.toLowerCase() === String(g.city).toLowerCase());
-      const city = fromMarkers ?? { name: g.city, lat: Number(g.lat), lng: Number(g.lng), temp: 24, rain: 900, humidity: 60, N: 75, P: 40, K: 38 };
-      await handleCityClick(city);
-    } catch (err) {
-      const msg = getErrorMessage(classifyError(err, "/geocode"));
-      setSearchError(msg);
-      setError(msg);
-    } finally {
-      setSearchLoading(false);
-    }
-  }, [locations, searchQuery]);
-
-  const debouncedSearch = useMemo(() => debounce((q) => handleSearch(q), 300), [handleSearch]);
-  useEffect(() => () => debouncedSearch.cancel(), [debouncedSearch]);
-
   const chartData = useMemo(() => {
     const history = result?.rainfallHistory ?? [];
     const points = result?.forecast ?? [];
@@ -514,25 +488,6 @@ export default function App() {
 
       {/* 3D Globe — Mapbox GL JS */}
       <main className="map-area">
-        <div style={{ position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", zIndex: 20, display: "flex", gap: 8, background: "rgba(15,23,42,0.78)", padding: 10, borderRadius: 12, border: "1px solid #334155", alignItems: "center", boxShadow: "0 8px 24px rgba(2,6,23,0.45)" }}>
-          <input
-            value={searchQuery}
-            onChange={(e) => {
-              setSearchQuery(e.target.value);
-              debouncedSearch(e.target.value);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") handleSearch();
-            }}
-            placeholder="Search city (e.g., London)"
-            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #334155", minWidth: 220 }}
-          />
-          <button onClick={handleSearch} style={{ padding: "8px 12px", borderRadius: 8 }} disabled={searchLoading}>
-            {searchLoading ? "Searching..." : "Search"}
-          </button>
-          {searchLoading ? <span style={{ color: "#cbd5e1", fontSize: 12 }}>⏳</span> : null}
-          {searchError ? <span style={{ color: "#fda4af", fontSize: 12, maxWidth: 260 }}>{searchError}</span> : null}
-        </div>
         <MapboxGlobe
           cities={locations}
           onCitySelect={handleCityClick}

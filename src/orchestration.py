@@ -126,8 +126,9 @@ def train_rainfall_forecast_task(
     csv_path: str = "data/Rain_fall_in_Pakistan.csv",
     output_path: str = "models/forecast_model.pkl",
 ) -> str:
-    out = train_rainfall_forecast_and_save(Path(csv_path), Path(output_path))
-    return str(out)
+    raise RuntimeError(
+        "Rainfall forecast training removed: backend time-series now comes from live NASA POWER temporal data."
+    )
 
 
 @task(name="train_yield_classifier_model")
@@ -282,10 +283,6 @@ def crop_agri_training_flow(
         k=k,
         random_state=random_state,
     )
-    rainfall_model = train_rainfall_forecast_task(
-        csv_path=rainfall_csv_path,
-        output_path=rainfall_forecast_output,
-    )
     classifier_model = train_classifier_task(
         csv_path=classifier_csv_path,
         output_path=classifier_output,
@@ -298,7 +295,6 @@ def crop_agri_training_flow(
             "classifier": _load_artifact_metrics(Path(classifier_output)),
             "recommender": _load_artifact_metrics(Path(recommender_output)),
             "clustering": _load_artifact_metrics(Path(clustering_output)),
-            "rainfall_forecast": _load_artifact_metrics(Path(rainfall_forecast_output)),
         },
     }
     _append_metrics_history(snapshot)
@@ -306,7 +302,6 @@ def crop_agri_training_flow(
         "crop_recommender_model": recommender_model,
         "clustering_model": cluster_model,
         "clustering_plot": clustering_plot_output,
-        "rainfall_forecast_model": rainfall_model,
         "classifier_model": classifier_model,
         "metrics_history": str(METRICS_HISTORY_PATH),
     }

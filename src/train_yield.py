@@ -2,12 +2,11 @@
 Train and compare crop-yield regressors on the processed dataset, pick the
 best model by test RMSE (tie-break: higher R2), save to models/yield_model.pkl.
 
-Expects data/processed_data.csv from src/preprocess.py with a dataset_split column
-and a numeric yield target (e.g. Crop_Yield).
+Expects a unified master dataset from src/build_master_dataset.py.
 
 Usage:
-    python src/preprocess.py --csv data/crop_yield_dataset.csv --target Crop_Yield --regression --drop-cols Date
-    python src/train_yield.py --processed data/processed_data.csv --target Crop_Yield
+    python src/build_master_dataset.py --output data/master_dataset.csv
+    python src/train_yield.py --csv data/master_dataset.csv --target crop_yield
 """
 
 from __future__ import annotations
@@ -21,18 +20,19 @@ from typing import Any, Iterable
 import joblib
 import pandas as pd
 import numpy as np
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
-
-from src.preprocess import build_feature_preprocessor, infer_feature_columns, load_csv
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 LOG = logging.getLogger("train_yield")
 
-CSV_DEFAULT = Path("data") / "crop_yield_dataset.csv"
+CSV_DEFAULT = Path("data") / "master_dataset.csv"
 MODEL_PATH = Path("models") / "yield_model.pkl"
 
 
@@ -90,23 +90,64 @@ def _pick_best(results: list[tuple[str, Any, dict[str, float]]]) -> tuple[str, A
     return best_name, best_model, best_metrics
 
 
+def _load_master(csv_path: Path, target_column: str) -> pd.DataFrame:
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Master dataset not found: {csv_path}. Run src/build_master_dataset.py first.")
+    df = pd.read_csv(csv_path)
+    if target_column not in df.columns:
+        raise ValueError(f"Target column {target_column!r} not found in {csv_path}. Columns: {list(df.columns)}")
+    return df
+
+
 def train_compare_and_save(
     csv_path: Path,
     target_column: str,
     model_path: Path,
     random_state: int,
 ) -> Path:
-    df = pd.read_csv(csv_path, nrows=100)
-    # Drop Date if it exists
-    if "Date" in df.columns:
-        df = df.drop(columns=["Date"])
-    numerical, categorical = infer_feature_columns(df, target_column)
-    preprocessor = build_feature_preprocessor(numerical, categorical)
-    
-    X = df.drop(columns=[target_column])
-    y = df[target_column].astype(float)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state)
+    df = _load_master(csv_path, target_column)
+
+    # Minimal, stable feature set from master dataset.
+    categorical = [c for c in ["country", "region", "crop_type"] if c in df.columns]
+    numeric = [c for c in ["temperature", "rainfall", "humidity", "N", "P", "K", "ph"] if c in df.columns]
+    feature_cols = numeric + categorical
+    if not feature_cols:
+        raise ValueError("No usable feature columns found in master dataset.")
+
+    X = df[feature_cols].copy()
+    y = pd.to_numeric(df[target_column], errors="coerce").astype(float)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=random_state)
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                numeric,
+            ),
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical,
+            ),
+        ],
+        remainder="drop",
+    )
+
     models: list[tuple[str, Any]] = [
         (
             "RandomForestRegressor",
@@ -114,11 +155,11 @@ def train_compare_and_save(
                 ("preprocessor", preprocessor),
                 ("regressor", TransformedTargetRegressor(
                     regressor=RandomForestRegressor(
-                        n_estimators=10,
+                        n_estimators=300,
                         max_depth=None,
                         min_samples_leaf=2,
                         random_state=random_state,
-                        n_jobs=1,
+                        n_jobs=-1,
                     ),
                     func=np.log1p,
                     inverse_func=np.expm1
@@ -179,8 +220,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--target",
         type=str,
-        default="Crop_Yield",
-        help="Yield target column name in CSV (default: Crop_Yield)",
+        default="crop_yield",
+        help="Yield target column name in master CSV (default: crop_yield)",
     )
     p.add_argument("--output", type=Path, default=MODEL_PATH, help="Output joblib path")
     p.add_argument("--random-state", type=int, default=42, help="Random seed for RF")

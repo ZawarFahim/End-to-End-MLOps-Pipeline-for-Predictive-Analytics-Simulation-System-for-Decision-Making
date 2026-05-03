@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from functools import lru_cache
 from pathlib import Path
@@ -13,10 +12,10 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from app.weather_api import get_real_world_weather
+from app.weather_api import get_nasa_daily_timeseries, get_real_world_weather
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
-from statsmodels.tsa.arima.model import ARIMA
+import json
 
 
 def _configure_logging() -> None:
@@ -35,7 +34,6 @@ LOG = logging.getLogger("ml_api")
 MODELS_DIR = Path("models")
 YIELD_MODEL_PATH = MODELS_DIR / "yield_model.pkl"
 CLASSIFIER_MODEL_PATH = MODELS_DIR / "classifier.pkl"
-FORECAST_MODEL_PATH = MODELS_DIR / "forecast_model.pkl"
 CLUSTER_MODEL_PATH = MODELS_DIR / "clustering.pkl"
 RECOMMENDER_MODEL_PATH = MODELS_DIR / "crop_recommender.pkl"
 METRICS_HISTORY_PATH = MODELS_DIR / "metrics_history.json"
@@ -66,7 +64,6 @@ async def lifespan(app: FastAPI):
     app.state.artifacts = {
         "yield": _safe_load_artifact(YIELD_MODEL_PATH, "yield"),
         "classifier": _safe_load_artifact(CLASSIFIER_MODEL_PATH, "classifier"),
-        "forecast": _safe_load_artifact(FORECAST_MODEL_PATH, "forecast"),
         "cluster": _safe_load_artifact(CLUSTER_MODEL_PATH, "cluster"),
         "recommender": _safe_load_artifact(RECOMMENDER_MODEL_PATH, "recommender"),
     }
@@ -216,14 +213,6 @@ def get_classifier_artifact() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
-def get_forecast_artifact() -> dict[str, Any]:
-    artifact = getattr(app.state, "artifacts", {}).get("forecast")
-    if artifact is None:
-        raise FileNotFoundError(f"Model file not found: {FORECAST_MODEL_PATH}")
-    return artifact
-
-
-@lru_cache(maxsize=1)
 def get_cluster_artifact() -> dict[str, Any]:
     artifact = getattr(app.state, "artifacts", {}).get("cluster")
     if artifact is None:
@@ -257,56 +246,6 @@ def _yield_request_to_pipeline_frame(data: YieldRequest) -> pd.DataFrame:
     if "Rainfall" not in expected_cols:
         expected_cols.append("Rainfall")
     return pd.DataFrame([row])[expected_cols]
-
-
-import httpx
-
-async def _forecast_three_values(city: str, lat: float | None = None, lng: float | None = None) -> list[float]:
-    if lat is not None and lng is not None:
-        try:
-            # Fetch dynamic real weather forecast from Open-Meteo
-            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&daily=precipitation_sum&timezone=auto&past_days=0"
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    daily = data.get("daily", {})
-                    precip = daily.get("precipitation_sum", [])
-                    # Return next 3 days
-                    if len(precip) >= 3:
-                        return [float(x) if x is not None else 0.0 for x in precip[:3]]
-        except Exception as e:
-            LOG.warning(f"Open-Meteo fetch failed for {lat},{lng}: {e}")
-            pass # Fallback to artifact
-
-    artifact = get_forecast_artifact()
-    city_key = city.strip().lower()
-    city_models = artifact.get("models") or artifact.get("city_models") or {}
-    if isinstance(city_models, dict) and city_key in city_models:
-        model = city_models[city_key]
-        raw = model.forecast(steps=3) if hasattr(model, "forecast") else model
-        return [float(x) for x in list(raw)[:3]]
-
-    model = artifact.get("model")
-    if model is not None and hasattr(model, "forecast"):
-        raw = model.forecast(steps=3)
-        return [float(x) for x in list(raw)[:3]]
-
-    model_type = str(artifact.get("model_type", "")).lower()
-    history = artifact.get("history")
-    if model_type == "rolling_mean":
-        if history is None:
-            raise ValueError("Forecast artifact rolling_mean requires history.")
-        window = int(artifact.get("window", 6))
-        base = float(pd.Series(history).tail(window).mean())
-        return [base, base, base]
-
-    if history is None:
-        raise ValueError("Forecast artifact is missing model/history.")
-
-    fitted = ARIMA(pd.Series(history), order=(1, 1, 1)).fit()
-    raw = fitted.forecast(steps=3)
-    return [float(x) for x in list(raw)[:3]]
 
 
 def _artifact_metrics(path: Path, label: str) -> dict[str, Any]:
@@ -409,7 +348,6 @@ def metrics() -> dict[str, Any]:
         "classifier": _artifact_metrics(CLASSIFIER_MODEL_PATH, "classifier"),
         "recommender": _artifact_metrics(RECOMMENDER_MODEL_PATH, "crop_recommender"),
         "clustering": _artifact_metrics(CLUSTER_MODEL_PATH, "clustering"),
-        "rainfall_forecast": _artifact_metrics(FORECAST_MODEL_PATH, "forecast_model"),
     }
     return {
         "message": "Model metrics snapshot",
@@ -656,9 +594,24 @@ async def forecast(data: ForecastRequest) -> dict[str, Any]:
         city = data.city.strip()
         if not city:
             raise ValueError("city is required")
-        forecast_values = await _forecast_three_values(city, data.lat, data.lng)
-        LOG.info("/forecast success for %s", city)
-        return {"city": city, "forecast": [float(v) for v in forecast_values]}
+        if data.lat is None or data.lng is None:
+            raise ValueError("lat and lng are required for NASA temporal series")
+
+        series = get_nasa_daily_timeseries(float(data.lat), float(data.lng), days=90)
+        historical = series.get("historical", [])
+        LOG.info("/forecast success for %s (n=%d)", city, len(historical))
+
+        # Keep response shape compatible with the frontend chart:
+        # - historical: list of {date, rainfall, temperature, humidity}
+        # - forecast: empty (NASA POWER is historical, not predictive forecast)
+        return {
+            "city": city,
+            "historical": historical,
+            "forecast": [],
+            "source": series.get("source"),
+            "start": series.get("start"),
+            "end": series.get("end"),
+        }
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except HTTPException:
@@ -720,12 +673,10 @@ def geocode(data: GeocodeRequest) -> dict[str, Any]:
     elif not contains.empty:
         m = contains
     else:
-    if _LOCATIONS_DF is None:
-        raise HTTPException(status_code=404, detail="No location dataset available")
-    m = _LOCATIONS_DF[
-        _LOCATIONS_DF["location_name"].astype(str).str.lower().str.contains(q)
-        | _LOCATIONS_DF["country"].astype(str).str.lower().str.contains(q)
-    ]
+        m = _LOCATIONS_DF[
+            _LOCATIONS_DF["location_name"].astype(str).str.lower().str.contains(q)
+            | _LOCATIONS_DF["country"].astype(str).str.lower().str.contains(q)
+        ]
     if m.empty:
         raise HTTPException(status_code=404, detail=f"No match for query: {data.query}")
     r = m.iloc[0]

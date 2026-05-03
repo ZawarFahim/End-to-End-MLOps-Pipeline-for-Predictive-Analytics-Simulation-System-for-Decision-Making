@@ -40,6 +40,27 @@ CLUSTER_MODEL_PATH = MODELS_DIR / "clustering.pkl"
 RECOMMENDER_MODEL_PATH = MODELS_DIR / "crop_recommender.pkl"
 METRICS_HISTORY_PATH = MODELS_DIR / "metrics_history.json"
 
+CLIMATE_RULES = {
+    "wheat": {"temp": (10, 30), "rainfall": (200, 800)},
+    "rice": {"temp": (20, 35), "rainfall": (800, 2000)},
+    "cotton": {"temp": (20, 40), "rainfall": (300, 900)},
+    "maize": {"temp": (15, 35), "rainfall": (300, 1200)},
+    "sugarcane": {"temp": (20, 35), "rainfall": (600, 1500)},
+    "coffee": {"temp": (18, 25), "rainfall": (1200, 2500)},
+}
+
+_LOCATIONS_DF: pd.DataFrame | None = None
+try:
+    _loc_path = Path("data") / "GlobalWeatherRepository.csv"
+    if _loc_path.is_file():
+        _LOCATIONS_DF = pd.read_csv(
+            _loc_path,
+            usecols=["country", "location_name", "latitude", "longitude"],
+            low_memory=False,
+        ).dropna()
+except Exception:
+    _LOCATIONS_DF = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.artifacts = {
@@ -98,6 +119,11 @@ class ClassifyRequest(BaseModel):
     temperature: float
     rainfall: float
     humidity: float
+
+
+class GeocodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(..., min_length=1)
 
 
 class ClusterRequest(BaseModel):
@@ -327,6 +353,29 @@ def _risk_from_probability(max_prob: float) -> str:
     return "high"
 
 
+def _climate_weight(crop: str, temperature: float, rainfall: float) -> float:
+    rule = CLIMATE_RULES.get(crop.lower())
+    if rule is None:
+        return 1.0
+    tmin, tmax = rule["temp"]
+    rmin, rmax = rule["rainfall"]
+    if (temperature < tmin - 5) or (temperature > tmax + 5):
+        return 0.0
+    if (rainfall < rmin - 300) or (rainfall > rmax + 300):
+        return 0.0
+    if (temperature < tmin) or (temperature > tmax):
+        return 0.45
+    if (rainfall < rmin) or (rainfall > rmax):
+        return 0.45
+    return 1.0
+
+
+def _weather_score(temperature: float, rainfall: float) -> int:
+    t_pen = min(abs(temperature - 24.0) * 3.0, 50.0)
+    r_pen = min(abs(rainfall - 900.0) / 25.0, 50.0)
+    return int(max(0.0, 100.0 - t_pen - r_pen))
+
+
 
 
 
@@ -548,6 +597,14 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
         allowed: list[str] = region_map.get(region_type, [])
 
         filtered = [(c, p) for c, p in all_ranked if c in allowed]
+        adjusted: list[tuple[str, float]] = []
+        for c, p in filtered:
+            cp = str(c).lower()
+            adj = float(p) * _climate_weight(cp, float(data.temperature), float(data.rainfall))
+            if cp == "rice" and float(data.rainfall) > 1200:
+                adj *= 1.2
+            adjusted.append((str(c), adj))
+        filtered = sorted(adjusted, key=lambda x: x[1], reverse=True)
         LOG.info("Filtered (%s): %s", region_type,
                  [(c, round(float(p), 3)) for c, p in filtered[:5]])
 
@@ -570,12 +627,17 @@ async def classify_yield(data: ClassifyRequest) -> dict[str, Any]:
             top_crops[0], risk_level, region_type,
         )
 
+        top_objs = [{"name": c.title(), "confidence": round(confidence_scores[i], 4)} for i, c in enumerate(top_crops)]
+        insights = {"summary": f"Ideal for {top_crops[0].title()} due to moderate rainfall" if top_crops else "No crop recommendation", "warnings": ["Low rainfall"] if float(data.rainfall) < 300 else []}
         return {
-            "top_crops":        top_crops,
+            "top_crops": top_crops,
             "confidence_scores": confidence_scores,
-            "risk_level":       risk_level,
-            "region_type":      region_type,
-            "climate_score":    round(climate_score, 2),
+            "top_crops_detailed": top_objs,
+            "risk_level": risk_level,
+            "region_type": region_type,
+            "climate_score": round(climate_score, 2),
+            "weather_score": _weather_score(float(data.temperature), float(data.rainfall)),
+            "insights": insights,
         }
 
     except FileNotFoundError as exc:
@@ -637,14 +699,20 @@ def cluster(request: ClusterRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Clustering failed: {exc}") from exc
 
 
-class RecommendRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    temperature: float = 25.0
-    rainfall: float = 500.0
-    humidity: float = 60.0
-    n: float = 70.0
-    p: float = 40.0
-    k: float = 40.0
+@app.post("/geocode")
+def geocode(data: GeocodeRequest) -> dict[str, Any]:
+    q = data.query.strip().lower()
+    if _LOCATIONS_DF is None:
+        raise HTTPException(status_code=404, detail="No location dataset available")
+    m = _LOCATIONS_DF[
+        _LOCATIONS_DF["location_name"].astype(str).str.lower().str.contains(q)
+        | _LOCATIONS_DF["country"].astype(str).str.lower().str.contains(q)
+    ]
+    if m.empty:
+        raise HTTPException(status_code=404, detail=f"No match for query: {data.query}")
+    r = m.iloc[0]
+    return {"lat": float(r["latitude"]), "lng": float(r["longitude"]), "city": str(r["location_name"])}
+
 
 @app.post("/recommend")
 async def recommend(data: RecommendRequest) -> dict[str, Any]:

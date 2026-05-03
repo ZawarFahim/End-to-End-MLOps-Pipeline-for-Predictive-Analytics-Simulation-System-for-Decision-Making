@@ -46,8 +46,11 @@ function popupHtml(p) {
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
-export default function MapboxGlobe({ cities, onCitySelect }) {
+export default function MapboxGlobe({ cities, onCitySelect, flyToCoord, highlightedCity }) {
   const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const rotatingRef = useRef(true);
+  const rotateTimeoutRef = useRef(null);
   // Keep onCitySelect stable — never a stale closure
   const onSelectRef  = useRef(onCitySelect);
   useEffect(() => { onSelectRef.current = onCitySelect; }, [onCitySelect]);
@@ -65,6 +68,7 @@ export default function MapboxGlobe({ cities, onCitySelect }) {
       center:     [10, 20],
       antialias:  true,
     });
+    mapRef.current = map;
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
@@ -126,9 +130,11 @@ export default function MapboxGlobe({ cities, onCitySelect }) {
       // ── Cursor feedback ──────────────────────────────────────────────────
       map.on("mouseenter", "city-hit", () => {
         map.getCanvas().style.cursor = "pointer";
+        rotatingRef.current = false;
       });
       map.on("mouseleave", "city-hit", () => {
         map.getCanvas().style.cursor = "";
+        rotatingRef.current = true;
       });
 
       // ── CLICK — fires on the hit layer (larger, easier to click) ────────
@@ -160,15 +166,41 @@ export default function MapboxGlobe({ cities, onCitySelect }) {
         // ← Trigger existing ML pipeline in App.jsx
         onSelectRef.current(city);
       });
+
+      const resumeRotation = () => {
+        if (rotateTimeoutRef.current) clearTimeout(rotateTimeoutRef.current);
+        rotateTimeoutRef.current = setTimeout(() => { rotatingRef.current = true; }, 1500);
+      };
+      map.on("mousedown", () => { rotatingRef.current = false; });
+      map.on("mouseup", resumeRotation);
+      map.on("dragstart", () => { rotatingRef.current = false; });
+      map.on("dragend", resumeRotation);
+
+      const spin = () => {
+        if (!mapRef.current) return;
+        if (rotatingRef.current) {
+          const c = mapRef.current.getCenter();
+          c.lng -= 0.05;
+          mapRef.current.easeTo({ center: c, duration: 50, easing: (n) => n, essential: true });
+        }
+        requestAnimationFrame(spin);
+      };
+      requestAnimationFrame(spin);
     });
 
     // Cleanup
     return () => {
       popup.remove();
+      if (rotateTimeoutRef.current) clearTimeout(rotateTimeoutRef.current);
       map.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!mapRef.current || !flyToCoord) return;
+    mapRef.current.flyTo({ center: [flyToCoord.lng, flyToCoord.lat], zoom: 4, duration: 1200 });
+  }, [flyToCoord]);
 
   return (
     <div

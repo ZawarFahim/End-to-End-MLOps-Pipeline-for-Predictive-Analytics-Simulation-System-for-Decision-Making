@@ -138,6 +138,9 @@ export default function App() {
   const [metricsHistory, setMetricsHistory] = useState([]);
   const [metricsRefreshedAt, setMetricsRefreshedAt] = useState("");
   const requestSeqRef = useRef(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [flyToCoord, setFlyToCoord] = useState(null);
+  const locations = useMemo(() => globalLocations, []);
 
   const fetchModelHealth = async () => {
     try {
@@ -324,6 +327,20 @@ export default function App() {
     }
   };
 
+  const handleSearch = async () => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    try {
+      const g = await postJson("/geocode", { query: q });
+      setFlyToCoord({ lat: Number(g.lat), lng: Number(g.lng) });
+      const fromMarkers = locations.find((c) => c.name.toLowerCase() === String(g.city).toLowerCase());
+      const city = fromMarkers ?? { name: g.city, lat: Number(g.lat), lng: Number(g.lng), temp: 24, rain: 900, humidity: 60, N: 75, P: 40, K: 38 };
+      await handleCityClick(city);
+    } catch (err) {
+      setError(getErrorMessage(classifyError(err, "/geocode")));
+    }
+  };
+
   const chartData = useMemo(() => {
     const history = result?.rainfallHistory ?? [];
     const points = result?.forecast ?? [];
@@ -476,9 +493,19 @@ export default function App() {
 
       {/* 3D Globe — Mapbox GL JS */}
       <main className="map-area">
+        <div style={{ position: "absolute", top: 12, left: 12, zIndex: 20, display: "flex", gap: 8 }}>
+          <input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search city (e.g., London)"
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #334155", minWidth: 220 }}
+          />
+          <button onClick={handleSearch} style={{ padding: "8px 12px", borderRadius: 8 }}>Search</button>
+        </div>
         <MapboxGlobe
-          cities={globalLocations}
+          cities={locations}
           onCitySelect={handleCityClick}
+          flyToCoord={flyToCoord}
         />
       </main>
     </div>

@@ -345,10 +345,6 @@ export default function App() {
     try {
       setSearchLoading(true);
       setSearchError("");
-  const handleSearch = async () => {
-    const q = searchQuery.trim();
-    if (!q) return;
-    try {
       const g = await postJson("/geocode", { query: q });
       setFlyToCoord({ lat: Number(g.lat), lng: Number(g.lng) });
       const fromMarkers = locations.find((c) => c.name.toLowerCase() === String(g.city).toLowerCase());

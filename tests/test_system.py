@@ -3,7 +3,7 @@ System/integration checks for the crop/agri FastAPI.
 
 Contract matches the React dashboard and strict Pydantic bodies:
   - POST /predict-yield  (YieldRequest; extra fields -> 422)
-  - POST /classify-yield (alias of predict-yield)
+  - POST /classify-yield (ClassifyRequest; extra fields -> 422)
   - POST /forecast       (ForecastRequest; extra fields -> 422)
   - POST /cluster
   - POST /recommend      (no JSON body)
@@ -85,8 +85,24 @@ def test_predict_yield_valid():
     assert body["risk_level"] in {"low", "high"}
 
 
-@pytest.mark.skipif(not _artifact_ready("yield"), reason="yield model not loaded at startup")
-def test_classify_yield_alias():
+@pytest.mark.skipif(not _artifact_ready("classifier"), reason="classifier model not loaded at startup")
+def test_classify_yield_valid():
+    payload = {
+        "temperature": 22.0,
+        "rainfall": 200.0,
+        "humidity": 55.0,
+    }
+    r = client.post("/classify-yield", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert "top_crops" in body
+    assert "confidence_scores" in body
+    assert "risk_level" in body
+    assert "region_type" in body
+    assert "climate_score" in body
+
+
+def test_classify_yield_rejects_unknown_fields():
     payload = {
         "temperature": 22.0,
         "rainfall": 200.0,
@@ -94,9 +110,7 @@ def test_classify_yield_alias():
         "crop_type": "Wheat",
     }
     r = client.post("/classify-yield", json=payload)
-    assert r.status_code == 200
-    body = r.json()
-    assert body == client.post("/predict-yield", json=payload).json()
+    assert r.status_code == 422
 
 
 def test_forecast_rejects_invalid_body():

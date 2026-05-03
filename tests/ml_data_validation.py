@@ -23,11 +23,11 @@ def run_data_integrity_check(csv_path: Path) -> None:
         raise FileNotFoundError(f"Dataset not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    dataset = Dataset(df)
+    dataset = Dataset(df, cat_features=["label"])
     result = data_integrity().run(dataset)
 
     # Fail CI if any check condition fails.
-    if not result.passed_conditions():
+    if not result.passed():
         details = result.to_json()
         raise RuntimeError(f"DeepChecks DataIntegrity failed conditions: {details}")
 

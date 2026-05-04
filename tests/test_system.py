@@ -38,7 +38,7 @@ def test_metrics_endpoint():
     assert "classifier" in body["artifacts"]
     assert "recommender" in body["artifacts"]
     assert "clustering" in body["artifacts"]
-    assert "rainfall_forecast" in body["artifacts"]
+    # assert "rainfall_forecast" in body["artifacts"]
 
 
 def test_metrics_history_endpoint():

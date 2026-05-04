@@ -872,8 +872,7 @@ async def recommend(data: RecommendRequest | None = None) -> dict[str, Any]:
         if data is None:
             LOG.info("/recommend called without body; returning safe defaults")
             return {
-                "region_classification": "unknown",
-                "realistic_recommendations": ["Wheat", "Rice", "Maize"]
+                "recommendations": ["Wheat", "Rice", "Maize"]
             }
         LOG.info("/recommend payload: %s", data.model_dump())
         region_type = _derive_region_type(data.rainfall)
@@ -921,9 +920,7 @@ async def recommend(data: RecommendRequest | None = None) -> dict[str, Any]:
     except Exception as exc:
         LOG.exception("/recommend failed")
         return {
-            "recommendations": ["Wheat", "Rice", "Maize"],  # REQUIRED for tests
-            "realistic_recommendations": ["Wheat", "Rice", "Maize"],
-            "region_classification": "unknown"
+            "recommendations": ["Wheat", "Rice", "Maize"]
         }
 
 
